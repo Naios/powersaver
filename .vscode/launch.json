@@ -1,0 +1,42 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug executable 'powersaver'",
+      "cargo": {
+        "args": [
+          "build",
+          "--bin=powersaver",
+          "--package=powersaver"
+        ],
+        "filter": {
+          "name": "powersaver",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in executable 'powersaver'",
+      "cargo": {
+        "args": [
+          "test",
+          "--no-run",
+          "--bin=powersaver",
+          "--package=powersaver"
+        ],
+        "filter": {
+          "name": "powersaver",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+# Process pooling time in seconds
+interval: 30
+
+# Case insensitive program names that promote the current
+# power scheme to "Balanced", otherwise "Power Saver" is set.
+balanced:
+  - Unreal
+  - Blender
+  - devenv
