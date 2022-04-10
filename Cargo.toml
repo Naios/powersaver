@@ -13,6 +13,11 @@ regex = "1.5.5"
 strum = { version = "0.24", features = ["derive"] }
 strum_macros = "0.24"
 notify = "5.0.0-pre.14"
+tray-item = "0.7.0"
+open = "2.1.1"
+
+[build-dependencies]
+windres = "*"
 
 [features]
 console = []

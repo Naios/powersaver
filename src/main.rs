@@ -22,6 +22,7 @@
 
 use core::time;
 use notify::{RecursiveMode, Watcher};
+use open;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -29,13 +30,29 @@ use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::{Arc, Condvar, Mutex};
+use strum::IntoEnumIterator;
 use strum_macros;
 use sysinfo::{ProcessExt, System, SystemExt};
+use tray_item::TrayItem;
 use winapi::shared::guiddef::GUID;
 use winapi::um::powersetting::{PowerGetActiveScheme, PowerSetActiveScheme};
 use winapi::DEFINE_GUID;
+
+static CONFIG_NAME: &'static str = "powersaver.yaml";
+static ENV_VAR_NAME: &'static str = "POWER_SAVER_CONFIG_PATH";
+static LINK_DOCUMENTATION: &'static str = "https://github.com/Naios/powersaver";
+
+static ICON_SAVE: &'static str = "icon-save";
+static ICON_POWER: &'static str = "icon-power";
+
+fn equal(left: &GUID, right: &GUID) -> bool {
+    (left.Data1 == right.Data1)
+        && (left.Data2 == right.Data2)
+        && (left.Data3 == right.Data3)
+        && (left.Data4 == right.Data4)
+}
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Config {
@@ -64,7 +81,7 @@ DEFINE_GUID! {GUID_ENERGY_SCHEME_BALANCED,
 // 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c (High Power)
 // Not used currently
 
-#[derive(Debug, Eq, PartialEq, strum_macros::Display)]
+#[derive(Debug, Eq, PartialEq, strum_macros::Display, Clone, Copy, strum_macros::EnumIter)]
 #[strum(serialize_all = "snake_case")]
 enum PowerLevel {
     Saving,
@@ -75,6 +92,14 @@ fn map_power_level_to_guid(level: &PowerLevel) -> GUID {
     match level {
         PowerLevel::Saving => GUID_ENERGY_SCHEME_SAVING,
         PowerLevel::Balanced => GUID_ENERGY_SCHEME_BALANCED,
+    }
+}
+
+fn map_guid_to_power_level(guid: &GUID) -> PowerLevel {
+    if equal(guid, &GUID_ENERGY_SCHEME_SAVING) {
+        PowerLevel::Saving
+    } else {
+        PowerLevel::Balanced
     }
 }
 
@@ -106,13 +131,6 @@ fn compute_intended_power_scheme_guid(system: &System, regex: &Regex) -> PowerLe
     }
 }
 
-fn equal(left: &GUID, right: &GUID) -> bool {
-    (left.Data1 == right.Data1)
-        && (left.Data2 == right.Data2)
-        && (left.Data3 == right.Data3)
-        && (left.Data4 == right.Data4)
-}
-
 fn get_config_path() -> PathBuf {
     // Program args
     let args: Vec<String> = env::args().collect();
@@ -121,20 +139,18 @@ fn get_config_path() -> PathBuf {
     }
 
     // Environment variable
-    if let Ok(path) = env::var("POWER_SAVER_CONFIG_PATH") {
+    if let Ok(path) = env::var(ENV_VAR_NAME) {
         return PathBuf::from(path);
     }
 
     // Executable path
-    let default_config_name: &'static str = "powersaver.yaml";
-
     if let Some(parent) = std::env::current_exe().unwrap().parent() {
         let mut buffer = PathBuf::new();
         buffer.push(parent);
-        buffer.push(default_config_name);
+        buffer.push(CONFIG_NAME);
         buffer
     } else {
-        PathBuf::from(default_config_name)
+        PathBuf::from(CONFIG_NAME)
     }
 }
 
@@ -142,6 +158,7 @@ struct State {
     system: System,
     changed: AtomicBool,
     stop: AtomicBool,
+    force: AtomicI32,
     condvar: Condvar,
     mutex: Mutex<()>,
 }
@@ -152,6 +169,7 @@ impl State {
             system: System::new_all(),
             changed: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            force: AtomicI32::new(0),
             condvar: Condvar::new(),
             mutex: Mutex::new(()),
         }
@@ -159,6 +177,15 @@ impl State {
 
     fn notify(&self) {
         self.condvar.notify_one();
+    }
+
+    fn get_forced(&self) -> Option<PowerLevel> {
+        let index = self.force.load(std::sync::atomic::Ordering::Acquire);
+        if index > 0 {
+            Some(PowerLevel::iter().nth((index - 1) as usize).unwrap())
+        } else {
+            None
+        }
     }
 }
 
@@ -174,10 +201,13 @@ impl PowerSaver {
 
         if let Some(first) = itr.next() {
             // Create the pattern for the balanced scheme
-            let pattern = itr.map(|s| regex::escape(s)).fold(
-                format!("({})", regex::escape(first.as_str())),
-                |left, right| -> String { format!("{left}|({right})") },
-            );
+            let pattern = itr
+                .filter(|s| !s.is_empty())
+                .map(|s| regex::escape(s))
+                .fold(
+                    format!("({})", regex::escape(first.as_str())),
+                    |left, right| -> String { format!("{left}|({right})") },
+                );
 
             RegexBuilder::new(pattern.as_str())
                 .case_insensitive(true)
@@ -199,18 +229,28 @@ impl PowerSaver {
         }
     }
 
-    fn update(&self) {
-        let intended = compute_intended_power_scheme_guid(&self.state.system, &self.regex);
+    fn update(&self) -> Option<PowerLevel> {
+        let intended = self.state.get_forced().unwrap_or_else(|| {
+            return compute_intended_power_scheme_guid(&self.state.system, &self.regex);
+        });
+
         let target = map_power_level_to_guid(&intended);
 
         if let Some(active) = get_active_power_scheme() {
             if !equal(&active, &target) {
-                set_active_power_scheme(&target);
-                println!("Setting active power scheme to '{intended}'.")
+                if set_active_power_scheme(&target) {
+                    println!("Setting active power scheme to '{intended}'.");
+
+                    return Some(intended);
+                } else {
+                    println!("Failed to set the active power scheme to '{intended}'.");
+                }
             } else {
                 println!("The current power scheme '{intended}' is equal to the current one.")
             }
         }
+
+        return None;
     }
 
     fn wait(&self) {
@@ -219,6 +259,94 @@ impl PowerSaver {
         let locked = self.state.mutex.lock().unwrap();
 
         let (_, _) = self.state.condvar.wait_timeout(locked, interval).unwrap();
+    }
+}
+
+fn force_callable(state: Arc<State>, level: Option<PowerLevel>) -> impl Fn() -> () {
+    move || {
+        if let Some(active) = level {
+            println!("Setting force to {active}");
+
+            let value = (active as i32) + 1;
+            state
+                .force
+                .store(value, std::sync::atomic::Ordering::Relaxed);
+
+            state.notify();
+        } else {
+            println!("Setting force to auto");
+
+            state.force.store(0, std::sync::atomic::Ordering::Relaxed);
+            state.notify();
+        }
+    }
+}
+
+fn setup_tray(tray: &mut TrayItem, state: Arc<State>, path: PathBuf) {
+    tray.add_label("Power Saver").unwrap();
+
+    tray.add_menu_item("Set Auto", force_callable(state.clone(), None))
+        .unwrap();
+
+    tray.add_menu_item(
+        "Force Power Saving",
+        force_callable(state.clone(), Some(PowerLevel::Saving)),
+    )
+    .unwrap();
+
+    tray.add_menu_item(
+        "Force Balanced",
+        force_callable(state.clone(), Some(PowerLevel::Balanced)),
+    )
+    .unwrap();
+
+    tray.add_menu_item("Open Config", move || {
+        if let Some(at) = path.as_path().to_str() {
+            println!("Opening config '{at}'");
+
+            match open::that(at) {
+                Err(error) => {
+                    println!("Failed to open the config '{at}' ({error})");
+                }
+                _ => {
+                    println!("Opening config '{at}'");
+                }
+            }
+        }
+    })
+    .unwrap();
+
+    tray.add_menu_item("Documentation", move || {
+        println!("Opening documentation");
+
+        let _ = open::that(LINK_DOCUMENTATION);
+    })
+    .unwrap();
+
+    tray.add_menu_item("Quit", {
+        let state_t2 = state.clone();
+        move || {
+            state_t2
+                .stop
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            state_t2.notify();
+        }
+    })
+    .unwrap();
+}
+
+fn select_tray_icon_by_power_level(level: PowerLevel) -> &'static str {
+    match level {
+        PowerLevel::Saving => ICON_SAVE,
+        _ => ICON_POWER,
+    }
+}
+
+fn select_initial_tray_icon() -> &'static str {
+    if let Some(guid) = get_active_power_scheme() {
+        select_tray_icon_by_power_level(map_guid_to_power_level(&guid))
+    } else {
+        ICON_SAVE
     }
 }
 
@@ -259,8 +387,21 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
 
     watcher.watch(path.as_path(), RecursiveMode::Recursive)?;
 
+    let initial = select_initial_tray_icon();
+    let mut tray = TrayItem::new("Power Saver", initial).expect("Failed to create the tray icon!");
+
+    setup_tray(&mut tray, state.clone(), path.clone());
+
     loop {
-        saver.update();
+        if let Some(updated) = saver.update() {
+            let icon = select_tray_icon_by_power_level(updated);
+
+            match tray.set_icon(icon) {
+                Err(error) => println!("Failed to set the tray icon to '{icon}' ({error})!"),
+                _ => {}
+            }
+        }
+
         saver.wait();
 
         if state.stop.load(std::sync::atomic::Ordering::Acquire) {
