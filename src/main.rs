@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::{Arc, Condvar, Mutex};
 use strum::IntoEnumIterator;
 use strum_macros;
-use sysinfo::{ProcessExt, System, SystemExt};
+use sysinfo::{ProcessExt, ProcessRefreshKind, System, SystemExt};
 use tray_item::TrayItem;
 use winapi::shared::guiddef::GUID;
 use winapi::um::powersetting::{PowerGetActiveScheme, PowerSetActiveScheme};
@@ -155,7 +155,6 @@ fn get_config_path() -> PathBuf {
 }
 
 struct State {
-    system: System,
     changed: AtomicBool,
     stop: AtomicBool,
     force: AtomicI32,
@@ -166,7 +165,6 @@ struct State {
 impl State {
     fn new() -> State {
         State {
-            system: System::new_all(),
             changed: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             force: AtomicI32::new(0),
@@ -187,6 +185,11 @@ impl State {
             None
         }
     }
+}
+
+fn refresh_processes(system: &mut System) {
+    // Refresh process list only
+    system.refresh_processes_specifics(ProcessRefreshKind::new());
 }
 
 struct PowerSaver {
@@ -229,9 +232,10 @@ impl PowerSaver {
         }
     }
 
-    fn update(&self) -> Option<PowerLevel> {
+    fn update(&self, system: &mut System) -> Option<PowerLevel> {
         let intended = self.state.get_forced().unwrap_or_else(|| {
-            return compute_intended_power_scheme_guid(&self.state.system, &self.regex);
+            refresh_processes(system);
+            return compute_intended_power_scheme_guid(&system, &self.regex);
         });
 
         let target = map_power_level_to_guid(&intended);
@@ -352,6 +356,7 @@ fn select_initial_tray_icon() -> &'static str {
 
 fn main() -> std::result::Result<(), Box<dyn Error>> {
     let state = Arc::new(State::new());
+    let mut system = System::new();
 
     let path = get_config_path();
     let readable = path.as_path().display().to_string();
@@ -393,7 +398,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     setup_tray(&mut tray, state.clone(), path.clone());
 
     loop {
-        if let Some(updated) = saver.update() {
+        if let Some(updated) = saver.update(&mut system) {
             let icon = select_tray_icon_by_power_level(updated);
 
             match tray.set_icon(icon) {
