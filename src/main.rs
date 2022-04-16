@@ -262,7 +262,7 @@ impl PowerSaver {
 
         let locked = self.state.mutex.lock().unwrap();
 
-        let (_, _) = self.state.condvar.wait_timeout(locked, interval).unwrap();
+        let _ = self.state.condvar.wait_timeout(locked, interval).unwrap();
     }
 }
 
@@ -354,6 +354,18 @@ fn select_initial_tray_icon() -> &'static str {
     }
 }
 
+fn try_set_icon(tray: &mut TrayItem, icon: &str) {
+    'outer: for attempt in 0..3 {
+        match tray.set_icon(icon) {
+            Err(error) => {
+                println!("Failed to set the tray icon to '{icon}' ({error}), attempt {attempt}!");
+                std::thread::sleep(time::Duration::from_secs(1));
+            }
+            _ => break 'outer,
+        }
+    }
+}
+
 fn main() -> std::result::Result<(), Box<dyn Error>> {
     let state = Arc::new(State::new());
     let mut system = System::new();
@@ -394,16 +406,24 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
 
     let initial = select_initial_tray_icon();
     let mut tray = TrayItem::new("Power Saver", initial).expect("Failed to create the tray icon!");
+    let mut periodic_counter = 0;
 
     setup_tray(&mut tray, state.clone(), path.clone());
 
     loop {
+        periodic_counter += 1;
+
         if let Some(updated) = saver.update(&mut system) {
             let icon = select_tray_icon_by_power_level(updated);
-
-            match tray.set_icon(icon) {
-                Err(error) => println!("Failed to set the tray icon to '{icon}' ({error})!"),
-                _ => {}
+            try_set_icon(&mut tray, &icon);
+            periodic_counter = 0;
+        } else if periodic_counter
+            >= (180 / std::cmp::min(std::cmp::max(1, saver.config.interval), 180))
+        {
+            if let Some(guid) = get_active_power_scheme() {
+                let icon = select_tray_icon_by_power_level(map_guid_to_power_level(&guid));
+                try_set_icon(&mut tray, &icon);
+                periodic_counter = 0;
             }
         }
 
