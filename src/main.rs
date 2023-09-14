@@ -119,10 +119,22 @@ fn set_active_power_scheme(guid: &GUID) -> bool {
 }
 
 fn compute_intended_power_scheme_guid(system: &System, regex: &Regex) -> PowerLevel {
-    let is_balanced = system
-        .processes()
-        .iter()
-        .any(|(_, process)| regex.is_match(process.name()));
+    let is_balanced = system.processes().iter().any(|(_, process)| {
+        let name = process.name();
+        let exe = process.exe().to_str().unwrap_or("");
+
+        if regex.is_match(exe) {
+            println!("Process exe '{exe}' matched!");
+            true
+        } else if regex.is_match(name) {
+            println!("Process name '{name}' matched!");
+            true
+        } else {
+            // println!("Process '{name}' ({exe}) did not match.");
+
+            false
+        }
+    });
 
     if is_balanced {
         PowerLevel::Balanced
